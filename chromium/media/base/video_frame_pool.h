@@ -41,6 +41,18 @@ class MEDIA_EXPORT VideoFramePool {
                                         const gfx::Size& natural_size,
                                         base::TimeDelta timestamp);
 
+  scoped_refptr<VideoFrame> CreateFrame(VideoPixelFormat format,
+                                        const gfx::Size& coded_size,
+                                        const gfx::Rect& visible_rect,
+                                        const gfx::Size& natural_size,
+                                        int32_t y_stride,
+                                        int32_t u_stride,
+                                        int32_t v_stride,
+                                        uint8_t* y_data,
+                                        uint8_t* u_data,
+                                        uint8_t* v_data,
+                                        base::TimeDelta timestamp);
+
  protected:
   friend class VideoFramePoolTest;
 

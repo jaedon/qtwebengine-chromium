@@ -86,7 +86,7 @@ bool FFmpegVideoDecoder::IsCodecSupported(VideoCodec codec) {
 }
 
 FFmpegVideoDecoder::FFmpegVideoDecoder(MediaLog* media_log)
-    : media_log_(media_log), state_(kUninitialized), decode_nalus_(false) {
+    : media_log_(media_log), state_(kUninitialized), decode_nalus_(false), decoder_v4l2m2m_(false) {
   DVLOG(1) << __func__;
   thread_checker_.DetachFromThread();
 }
@@ -325,6 +325,10 @@ bool FFmpegVideoDecoder::FFmpegDecode(const DecoderBuffer& buffer) {
 
     // Let FFmpeg handle presentation timestamp reordering.
     codec_context_->reordered_opaque = buffer.timestamp().InMicroseconds();
+    if (decoder_v4l2m2m_) {
+      packet.pts = codec_context_->reordered_opaque;
+      packet.dts = codec_context_->reordered_opaque;
+    }
   }
 
   switch (decoding_loop_->DecodePacket(
@@ -361,6 +365,72 @@ bool FFmpegVideoDecoder::OnNewFrame(AVFrame* frame) {
     return false;
   }
 
+  if (decoder_v4l2m2m_) {
+    const VideoPixelFormat format =
+        AVPixelFormatToVideoPixelFormat(codec_context_->pix_fmt);
+
+    gfx::Size size(frame->width, frame->height);
+    const int ret = av_image_check_size(size.width(), size.height(), 0, NULL);
+    if (ret < 0)
+      return false;
+
+    gfx::Size natural_size;
+    if (codec_context_->sample_aspect_ratio.num > 0) {
+      natural_size = GetNaturalSize(size,
+                                    codec_context_->sample_aspect_ratio.num,
+                                    codec_context_->sample_aspect_ratio.den);
+    } else {
+      natural_size =
+          GetNaturalSize(gfx::Rect(size), config_.GetPixelAspectRatio());
+    }
+
+    scoped_refptr<VideoFrame> video_frame = frame_pool_.CreateFrame(
+        format, size, gfx::Rect(size), natural_size,
+        frame->linesize[VideoFrame::kYPlane],
+        frame->linesize[VideoFrame::kUPlane],
+        frame->linesize[VideoFrame::kVPlane],
+        frame->data[VideoFrame::kYPlane],
+        frame->data[VideoFrame::kUPlane],
+        frame->data[VideoFrame::kVPlane],
+        kNoTimestamp);
+
+    if (!video_frame)
+      return false;
+
+    VideoColorSpace color_space = AVColorSpaceToColorSpace(
+        codec_context_->colorspace, codec_context_->color_range);
+    if (!color_space.IsSpecified())
+      color_space = config_.color_space_info();
+    video_frame->set_color_space(color_space.ToGfxColorSpace());
+
+    if (codec_context_->codec_id == AV_CODEC_ID_VP8 &&
+        codec_context_->color_primaries == AVCOL_PRI_UNSPECIFIED &&
+        codec_context_->color_trc == AVCOL_TRC_UNSPECIFIED &&
+        codec_context_->colorspace == AVCOL_SPC_BT470BG) {
+      if (codec_context_->color_range == AVCOL_RANGE_JPEG) {
+        video_frame->set_color_space(gfx::ColorSpace::CreateJpeg());
+      }
+    } else if (codec_context_->color_primaries != AVCOL_PRI_UNSPECIFIED ||
+              codec_context_->color_trc != AVCOL_TRC_UNSPECIFIED ||
+              codec_context_->colorspace != AVCOL_SPC_UNSPECIFIED) {
+      media::VideoColorSpace video_color_space = media::VideoColorSpace(
+          codec_context_->color_primaries, codec_context_->color_trc,
+          codec_context_->colorspace,
+          codec_context_->color_range != AVCOL_RANGE_MPEG
+              ? gfx::ColorSpace::RangeID::FULL
+              : gfx::ColorSpace::RangeID::LIMITED);
+      video_frame->set_color_space(video_color_space.ToGfxColorSpace());
+    }
+
+    VideoFrame* opaque = video_frame.get();
+    opaque->AddRef();
+
+    video_frame->set_timestamp(
+        base::TimeDelta::FromMicroseconds(frame->pts + decoder_v4l2m2m_sync_delay_));
+    video_frame->metadata()->SetBoolean(VideoFrameMetadata::POWER_EFFICIENT,
+                                        false);
+    output_cb_.Run(video_frame);
+  } else {
   scoped_refptr<VideoFrame> video_frame =
       reinterpret_cast<VideoFrame*>(av_buffer_get_opaque(frame->buf[0]));
   video_frame->set_timestamp(
@@ -368,6 +438,7 @@ bool FFmpegVideoDecoder::OnNewFrame(AVFrame* frame) {
   video_frame->metadata()->SetBoolean(VideoFrameMetadata::POWER_EFFICIENT,
                                       false);
   output_cb_.Run(video_frame);
+  }
   return true;
 }
 
@@ -397,7 +468,26 @@ bool FFmpegVideoDecoder::ConfigureDecoder(const VideoDecoderConfig& config,
   if (decode_nalus_)
     codec_context_->flags2 |= AV_CODEC_FLAG2_CHUNKS;
 
-  AVCodec* codec = avcodec_find_decoder(codec_context_->codec_id);
+  AVCodec* codec = NULL;
+  if (codec_context_->codec_id == AV_CODEC_ID_H264)
+    codec = avcodec_find_decoder_by_name("h264_v4l2m2m");
+  else if (codec_context_->codec_id == AV_CODEC_ID_VP9)
+    codec = avcodec_find_decoder_by_name("vp9_v4l2m2m");
+  else if (codec_context_->codec_id == AV_CODEC_ID_HEVC)
+    codec = avcodec_find_decoder_by_name("hevc_v4l2m2m");
+  if (codec) {
+    decoder_v4l2m2m_ = true;
+    decoder_v4l2m2m_sync_delay_ = 300 * 1000; // TODO option
+    codec_context_->thread_count = 1;
+    codec_context_->thread_type = 3;
+    codec_context_->get_buffer2 = NULL;
+    codec_context_->time_base.num = 1;
+    codec_context_->time_base.den = base::Time::kMicrosecondsPerSecond;
+    codec_context_->pkt_timebase.num = 1;
+    codec_context_->pkt_timebase.den = base::Time::kMicrosecondsPerSecond;
+  }
+  if (!codec)
+    codec = avcodec_find_decoder(codec_context_->codec_id);
   if (!codec || avcodec_open2(codec_context_.get(), codec, NULL) < 0) {
     ReleaseFFmpegResources();
     return false;

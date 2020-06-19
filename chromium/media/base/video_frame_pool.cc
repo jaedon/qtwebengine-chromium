@@ -27,6 +27,18 @@ class VideoFramePool::PoolImpl
                                         const gfx::Size& natural_size,
                                         base::TimeDelta timestamp);
 
+  scoped_refptr<VideoFrame> CreateFrame(VideoPixelFormat format,
+                                        const gfx::Size& coded_size,
+                                        const gfx::Rect& visible_rect,
+                                        const gfx::Size& natural_size,
+                                        int32_t y_stride,
+                                        int32_t u_stride,
+                                        int32_t v_stride,
+                                        uint8_t* y_data,
+                                        uint8_t* u_data,
+                                        uint8_t* v_data,
+                                        base::TimeDelta timestamp);
+
   // Shuts down the frame pool and releases all frames in |frames_|.
   // Once this is called frames will no longer be inserted back into
   // |frames_|.
@@ -117,6 +129,62 @@ scoped_refptr<VideoFrame> VideoFramePool::PoolImpl::CreateFrame(
   return wrapped_frame;
 }
 
+scoped_refptr<VideoFrame> VideoFramePool::PoolImpl::CreateFrame(
+    VideoPixelFormat format,
+    const gfx::Size& coded_size,
+    const gfx::Rect& visible_rect,
+    const gfx::Size& natural_size,
+    int32_t y_stride,
+    int32_t u_stride,
+    int32_t v_stride,
+    uint8_t* y_data,
+    uint8_t* u_data,
+    uint8_t* v_data,
+    base::TimeDelta timestamp) {
+  base::AutoLock auto_lock(lock_);
+  DCHECK(!is_shutdown_);
+
+  scoped_refptr<VideoFrame> frame;
+  while (!frame && !frames_.empty()) {
+    scoped_refptr<VideoFrame> pool_frame = std::move(frames_.back().frame);
+    frames_.pop_back();
+
+    if (false &&
+        pool_frame->format() == format &&
+        pool_frame->coded_size() == coded_size &&
+        pool_frame->visible_rect() == visible_rect &&
+        pool_frame->natural_size() == natural_size) {
+      frame = pool_frame;
+      frame->set_timestamp(timestamp);
+      frame->metadata()->Clear();
+      break;
+    }
+  }
+
+  if (!frame) {
+    frame = VideoFrame::WrapExternalYuvData(
+        format, coded_size, visible_rect, natural_size,
+        y_stride,
+        u_stride,
+        v_stride,
+        y_data,
+        u_data,
+        v_data,
+        timestamp);
+    // This can happen if the arguments are not valid.
+    if (!frame) {
+      LOG(ERROR) << "Failed to create a video frame";
+      return nullptr;
+    }
+  }
+
+  scoped_refptr<VideoFrame> wrapped_frame = VideoFrame::WrapVideoFrame(
+      *frame, frame->format(), frame->visible_rect(), frame->natural_size());
+  wrapped_frame->AddDestructionObserver(base::Bind(
+      &VideoFramePool::PoolImpl::FrameReleased, this, std::move(frame)));
+  return wrapped_frame;
+}
+
 void VideoFramePool::PoolImpl::Shutdown() {
   base::AutoLock auto_lock(lock_);
   is_shutdown_ = true;
@@ -157,6 +225,28 @@ scoped_refptr<VideoFrame> VideoFramePool::CreateFrame(
     const gfx::Size& natural_size,
     base::TimeDelta timestamp) {
   return pool_->CreateFrame(format, coded_size, visible_rect, natural_size,
+                            timestamp);
+}
+
+scoped_refptr<VideoFrame> VideoFramePool::CreateFrame(
+    VideoPixelFormat format,
+    const gfx::Size& coded_size,
+    const gfx::Rect& visible_rect,
+    const gfx::Size& natural_size,
+    int32_t y_stride,
+    int32_t u_stride,
+    int32_t v_stride,
+    uint8_t* y_data,
+    uint8_t* u_data,
+    uint8_t* v_data,
+    base::TimeDelta timestamp) {
+  return pool_->CreateFrame(format, coded_size, visible_rect, natural_size,
+                            y_stride,
+                            u_stride,
+                            v_stride,
+                            y_data,
+                            u_data,
+                            v_data,
                             timestamp);
 }
 

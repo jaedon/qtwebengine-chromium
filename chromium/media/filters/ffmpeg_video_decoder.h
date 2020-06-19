@@ -91,6 +91,10 @@ class MEDIA_EXPORT FFmpegVideoDecoder : public VideoDecoder {
 
   bool decode_nalus_;
 
+  bool decoder_v4l2m2m_;
+
+  int64_t decoder_v4l2m2m_sync_delay_;
+
   std::unique_ptr<FFmpegDecodingLoop> decoding_loop_;
 
   DISALLOW_COPY_AND_ASSIGN(FFmpegVideoDecoder);
